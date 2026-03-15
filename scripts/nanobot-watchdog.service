@@ -1,0 +1,29 @@
+[Unit]
+Description=nanobot Watchdog - Health Monitor and Auto-Recovery
+Documentation=https://github.com/HKUDS/nanobot
+After=nanobot.service
+Wants=nanobot.service
+
+[Service]
+Type=simple
+User=nn
+Group=nn
+
+WorkingDirectory=/home/nn/.nanobot/workspace/nano
+
+Environment="PATH=/home/nn/.nanobot/workspace/nano/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+# Run watchdog script
+ExecStart=/home/nn/.nanobot/workspace/nano/scripts/watchdog.py
+
+# Restart watchdog if it crashes
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nanobot-watchdog
+
+[Install]
+WantedBy=multi-user.target

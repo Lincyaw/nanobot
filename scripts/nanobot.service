@@ -1,0 +1,49 @@
+[Unit]
+Description=nanobot AI Assistant Gateway
+Documentation=https://github.com/HKUDS/nanobot
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=nn
+Group=nn
+
+# Working directory
+WorkingDirectory=/home/nn/.nanobot/workspace/nano
+
+# Environment
+Environment="PATH=/home/nn/.nanobot/workspace/nano/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="NANOBOT_WORKSPACE=/home/nn/.nanobot/workspace"
+Environment="PYTHONUNBUFFERED=1"
+
+# Main process with auto-restart
+ExecStart=/home/nn/.nanobot/workspace/nano/.venv/bin/uv run nanobot gateway
+Restart=always
+RestartSec=5
+
+# Health check
+ExecStartPre=/home/nn/.nanobot/workspace/nano/scripts/healthcheck.sh
+ExecStartPost=/home/nn/.nanobot/workspace/nano/scripts/on-start.sh
+
+# Graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+# Allow write access to workspace and config
+ReadWritePaths=/home/nn/.nanobot/workspace /home/nn/.nanobot/config
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nanobot
+
+[Install]
+WantedBy=multi-user.target

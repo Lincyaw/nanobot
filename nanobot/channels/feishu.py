@@ -242,6 +242,10 @@ class FeishuConfig(Base):
     verification_token: str = ""
     allow_from: list[str] = Field(default_factory=list)
     react_emoji: str = "THUMBSUP"
+    timeout: int = 30  # Request timeout in seconds
+    max_retries: int = 3  # Maximum retry attempts
+    base_retry_delay: float = 1.0  # Base delay between retries (seconds)
+    enable_fallback: bool = True  # Enable format fallback (interactive→post→text)
     group_policy: Literal["open", "mention"] = "mention"
     reply_to_message: bool = False  # If True, bot replies quote the user's original message
 
@@ -395,25 +399,46 @@ class FeishuChannel(BaseChannel):
         return self._is_bot_mentioned(message)
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
-        """Sync helper for adding reaction (runs in thread pool)."""
+        """Sync helper for adding reaction with retry (runs in thread pool)."""
         from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji
-        try:
-            request = CreateMessageReactionRequest.builder() \
-                .message_id(message_id) \
-                .request_body(
-                    CreateMessageReactionRequestBody.builder()
-                    .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
-                    .build()
-                ).build()
+        import time
+        from requests.exceptions import ConnectionError, Timeout
+        import ssl
 
-            response = self._client.im.v1.message_reaction.create(request)
+        max_retries = self.config.max_retries
+        base_delay = self.config.base_retry_delay
 
-            if not response.success():
-                logger.warning("Failed to add reaction: code={}, msg={}", response.code, response.msg)
-            else:
-                logger.debug("Added {} reaction to message {}", emoji_type, message_id)
-        except Exception as e:
-            logger.warning("Error adding reaction: {}", e)
+        for attempt in range(max_retries):
+            try:
+                request = CreateMessageReactionRequest.builder() \
+                    .message_id(message_id) \
+                    .request_body(
+                        CreateMessageReactionRequestBody.builder()
+                        .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
+                        .build()
+                    ).build()
+
+                response = self._client.im.v1.message_reaction.create(request)
+
+                if not response.success():
+                    logger.warning("Failed to add reaction (attempt {}): code={}, msg={}", attempt + 1, response.code, response.msg)
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        time.sleep(delay)
+                        continue
+                else:
+                    logger.debug("Added {} reaction to message {}", emoji_type, message_id)
+                    return
+            except (ConnectionError, Timeout, ssl.SSLError, ConnectionResetError) as e:
+                logger.warning("Reaction failed (attempt {}): {}", attempt + 1, e)
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    time.sleep(delay)
+                else:
+                    logger.warning("Failed to add reaction after {} attempts: {}", max_retries, e)
+            except Exception as e:
+                logger.warning("Error adding reaction: {}", e)
+                return
 
     async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
         """
@@ -878,31 +903,147 @@ class FeishuChannel(BaseChannel):
             logger.error("Error replying to Feishu message {}: {}", parent_message_id, e)
             return False
 
-    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
-        """Send a single message (text/image/file/interactive) synchronously."""
+    def _send_message_sync(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        msg_type: str,
+        content: str,
+        enable_fallback: bool = True,
+    ) -> bool:
+        """Send a single message (text/image/file/interactive) synchronously with retry and fallback.
+
+        Args:
+            receive_id_type: Type of receive ID (open_id, chat_id, etc.)
+            receive_id: Target user/chat ID
+            msg_type: Message type (text, post, interactive, image, file, etc.)
+            content: Message content (JSON string for structured types)
+            enable_fallback: Whether to enable format fallback (interactive→post→text)
+
+        Returns:
+            True if message sent successfully, False otherwise
+        """
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-        try:
-            request = CreateMessageRequest.builder() \
-                .receive_id_type(receive_id_type) \
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(receive_id)
-                    .msg_type(msg_type)
-                    .content(content)
-                    .build()
-                ).build()
-            response = self._client.im.v1.message.create(request)
-            if not response.success():
-                logger.error(
-                    "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
-                    msg_type, response.code, response.msg, response.get_log_id()
-                )
-                return False
-            logger.debug("Feishu {} message sent to {}", msg_type, receive_id)
+        import time
+        from requests.exceptions import ConnectionError, Timeout
+        import ssl
+
+        max_retries = self.config.max_retries
+        base_delay = self.config.base_retry_delay
+
+        # Format fallback chain for complex message types
+        fallback_chain = {
+            "interactive": ["post", "text"],
+            "post": ["text"],
+        } if enable_fallback else {}
+
+        def _do_send(mt: str, ct: str) -> tuple[bool, bool]:
+            """Attempt to send message. Returns (success, should_fallback)."""
+            for attempt in range(max_retries):
+                try:
+                    request = CreateMessageRequest.builder() \
+                        .receive_id_type(receive_id_type) \
+                        .request_body(
+                            CreateMessageRequestBody.builder()
+                            .receive_id(receive_id)
+                            .msg_type(mt)
+                            .content(ct)
+                            .build()
+                        ).build()
+                    response = self._client.im.v1.message.create(request)
+                    if not response.success():
+                        logger.error(
+                            "Failed to send Feishu {} message (attempt {}): code={}, msg={}, log_id={}",
+                            mt, attempt + 1, response.code, response.msg, response.get_log_id()
+                        )
+                        # Non-retryable API errors - should fallback if available
+                        if response.code in (11310, 99991008):  # 11310: table limit, 99991008: content too long
+                            return False, True
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (2 ** attempt)
+                            logger.warning("Retrying in {} seconds...", delay)
+                            time.sleep(delay)
+                            continue
+                        return False, True
+                    logger.debug("Feishu {} message sent to {}", mt, receive_id)
+                    return True, False
+                except (ConnectionError, Timeout, ssl.SSLError, ConnectionResetError) as e:
+                    logger.warning(
+                        "Feishu {} message send failed (attempt {}): {}",
+                        mt, attempt + 1, e
+                    )
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning("Retrying in {} seconds...", delay)
+                        time.sleep(delay)
+                    else:
+                        logger.error("Failed to send Feishu {} message after {} attempts: {}", mt, max_retries, e)
+                        return False, False  # Network errors - don't fallback, just fail
+                except Exception as e:
+                    logger.error("Error sending Feishu {} message: {}", mt, e)
+                    return False, False
+            return False, False
+
+        # Try initial format
+        success, should_fallback = _do_send(msg_type, content)
+        if success:
             return True
-        except Exception as e:
-            logger.error("Error sending Feishu {} message: {}", msg_type, e)
-            return False
+
+        # Try fallback formats if enabled and applicable
+        if should_fallback and msg_type in fallback_chain:
+            for fallback_type in fallback_chain[msg_type]:
+                logger.warning("Attempting fallback to {} format...", fallback_type)
+                fallback_content = self._convert_to_fallback_format(msg_type, content, fallback_type)
+                if fallback_content:
+                    success, should_fallback = _do_send(fallback_type, fallback_content)
+                    if success:
+                        logger.info("Successfully sent message using {} fallback format", fallback_type)
+                        return True
+
+        return False
+
+    def _convert_to_fallback_format(
+        self, from_type: str, content: str, to_type: str
+    ) -> str | None:
+        """Convert message content from one format to another for fallback.
+
+        Args:
+            from_type: Original message type (interactive, post)
+            content: Original content (JSON string)
+            to_type: Target fallback type (post, text)
+
+        Returns:
+            Converted content (JSON string), or None if conversion not possible
+        """
+        try:
+            content_json = json.loads(content) if content else {}
+        except json.JSONDecodeError:
+            return None
+
+        if from_type == "interactive" and to_type == "post":
+            # Extract text from interactive card and convert to post format
+            text_parts = _extract_interactive_content(content_json)
+            if text_parts:
+                text = "\n".join(text_parts)
+                return self._markdown_to_post(text)
+            return None
+
+        elif from_type == "interactive" and to_type == "text":
+            # Extract plain text from interactive card
+            text_parts = _extract_interactive_content(content_json)
+            if text_parts:
+                text = "\n".join(text_parts)
+                return json.dumps({"text": text}, ensure_ascii=False)
+            return None
+
+        elif from_type == "post" and to_type == "text":
+            # Extract plain text from post format
+            text = _extract_post_text(content_json)
+            if text:
+                return json.dumps({"text": text}, ensure_ascii=False)
+            return None
+
+        return None
 
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu, including media (images/files) if present."""
@@ -944,7 +1085,13 @@ class FeishuChannel(BaseChannel):
                     if ok:
                         return
                     # Fall back to regular send if reply fails
-                self._send_message_sync(receive_id_type, msg.chat_id, m_type, content)
+                self._send_message_sync(
+                    receive_id_type,
+                    msg.chat_id,
+                    m_type,
+                    content,
+                    self.config.enable_fallback,
+                )
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -1103,6 +1250,23 @@ class FeishuChannel(BaseChannel):
             content = "\n".join(content_parts) if content_parts else ""
 
             if not content and not media_paths:
+                return
+
+            # Handle slash commands
+            if content.strip().lower() in ("/new", "/stop", "/help"):
+                # Forward slash commands to the bus for unified handling in AgentLoop
+                reply_to = chat_id if chat_type == "group" else sender_id
+                await self._handle_message(
+                    sender_id=sender_id,
+                    chat_id=reply_to,
+                    content=content.strip().lower(),
+                    media=media_paths,
+                    metadata={
+                        "message_id": message_id,
+                        "chat_type": chat_type,
+                        "msg_type": msg_type,
+                    }
+                )
                 return
 
             # Forward to message bus
